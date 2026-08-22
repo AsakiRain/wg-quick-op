@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"github.com/dn-11/wg-quick-op/quick"
-	"github.com/rs/zerolog/log"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
@@ -17,19 +16,17 @@ var randomPort int = 0
 func newDDNS(iface string) (*ddns, error) {
 	var ddnsConfig ddns
 	ddnsConfig.name = iface
-	cfg, err := quick.GetConfig(iface)
+	cfg, err := quick.LoadConfig(iface)
 	if err != nil {
 		return nil, err
 	}
 	ddnsConfig.cfg = cfg
+	if err := ddnsConfig.cfg.LoadPeers(); err != nil {
+		return nil, err
+	}
 	if ddnsConfig.cfg.ListenPort == nil {
 		ddnsConfig.cfg.ListenPort = &randomPort
 	}
-
-	endpoints, err := quick.GetUnresolvedEndpoints(iface)
-	if err != nil {
-		log.Err(err).Str("iface", iface).Msg("failed to get unresolved unresolved Endpoint")
-	}
-	ddnsConfig.unresolvedEndpoints = endpoints
+	ddnsConfig.unresolvedEndpoints = ddnsConfig.cfg.UnresolvedEndpoints()
 	return &ddnsConfig, nil
 }

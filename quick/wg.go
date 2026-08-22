@@ -26,6 +26,12 @@ func Up(cfg *Config, iface string, logger zerolog.Logger) error {
 	if !errors.As(err, &linkNotFoundError) {
 		return err
 	}
+	if err := cfg.LoadPeers(); err != nil {
+		return fmt.Errorf("cannot parse peer config: %w", err)
+	}
+	if err := cfg.ResolveEndpoints(); err != nil {
+		return fmt.Errorf("cannot resolve peer config: %w", err)
+	}
 
 	for _, dns := range cfg.DNS {
 		if err := execSh("resolvconf -a tun.%i -m 0 -x", iface, logger, fmt.Sprintf("nameserver %s\n", dns)); err != nil {
@@ -133,6 +139,12 @@ func execSh(command string, iface string, logger zerolog.Logger, stdin ...string
 // * SyncAddress --> synces linux addresses bounded to this interface
 // * SyncRoutes --> synces all allowedIP routes to route to this interface, if Table is not off
 func Sync(cfg *Config, iface string, logger zerolog.Logger) error {
+	if err := cfg.LoadPeers(); err != nil {
+		return fmt.Errorf("cannot parse peer config: %w", err)
+	}
+	if err := cfg.ResolveEndpoints(); err != nil {
+		return fmt.Errorf("cannot resolve peer config: %w", err)
+	}
 	link, err := SyncLink(cfg, iface, logger)
 	if err != nil {
 		logger.Err(err).Msg("cannot sync wireguard link")
@@ -141,10 +153,20 @@ func Sync(cfg *Config, iface string, logger zerolog.Logger) error {
 	logger.Info().Msg("synced link")
 
 	if err := SyncWireguardDevice(cfg, link, logger); err != nil {
-		logger.Err(err).Msg("cannot sync wireguard link")
+		logger.Err(err).Msg("cannot sync WireGuard device")
 		return err
 	}
-	logger.Info().Msg("synced link")
+	// Userspace implementations may apply their default MTU while finishing
+	// initialization, after the link first becomes visible.
+	link, err = netlink.LinkByName(iface)
+	if err != nil {
+		logger.Err(err).Msg("cannot refresh link")
+		return err
+	}
+	if err := SyncLinkMTU(cfg, link, logger); err != nil {
+		return err
+	}
+	logger.Info().Msg("synced WireGuard device")
 
 	if err := SyncAddress(cfg, link, logger); err != nil {
 		logger.Err(err).Msg("cannot sync addresses")
@@ -224,6 +246,24 @@ func SyncLink(cfg *Config, iface string, logger zerolog.Logger) (netlink.Link, e
 	}
 	logger.Info().Msg("set device up")
 	return link, nil
+}
+
+func SyncLinkMTU(cfg *Config, link netlink.Link, logger zerolog.Logger) error {
+	if cfg.MTU <= 0 {
+		return nil
+	}
+	if link.Attrs().MTU == cfg.MTU {
+		logger.Debug().Int("mtu", cfg.MTU).Msg("device mtu already set")
+		return nil
+	}
+	if err := netlink.LinkSetMTU(link, cfg.MTU); err != nil { // 设置网卡MTU
+		logger.Err(err).Int("mtu", cfg.MTU).Msg("cannot set device mtu")
+		return err
+	}
+	link.Attrs().MTU = cfg.MTU // 更新 GO 结构体里的 MTU 值
+
+	logger.Info().Int("mtu", cfg.MTU).Msg("set device mtu")
+	return nil
 }
 
 // SyncAddress adds/deletes all lind assigned IPV4 addressed as specified in the config

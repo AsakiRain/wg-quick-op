@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -20,9 +21,18 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
+var wireguardConfigDir = "/etc/wireguard"
+
 // Config represents full wg-quick like config structure
 type Config struct {
 	wgtypes.Config
+	configText       []byte
+	configScanned    bool
+	interfaceEntries []configEntry
+	interfaceLoaded  bool
+	peerSections     [][]configEntry
+	peersLoaded      bool
+	peerEndpoints    map[wgtypes.Key]peerEndpoint
 
 	// Address list of IP (v4 or v6) addresses (optionally with CIDR masks) to be assigned to the interface. May be specified multiple times.
 	Address []net.IPNet
@@ -35,6 +45,8 @@ type Config struct {
 
 	// Table — Controls the routing table to which routes are added.
 	Table *int
+	// TableSet tracks whether Table was explicitly configured.
+	TableSet bool
 
 	// PreUp, PostUp, PreDown, PostDown — script snippets which will be executed by bash(1) before/after setting up/tearing down the interface, most commonly used to configure custom DNS options or firewall rules. The special string ‘%i’ is expanded to INTERFACE. Each one may be specified multiple times, in which case the commands are executed in order.
 	PreUp    []string
@@ -53,14 +65,10 @@ type Config struct {
 
 	// WireGuard-go binary path, left empty for kernel WireGuard
 	WgBin string
+
+	// MTUSet tracks whether MTU was explicitly configured.
+	MTUSet bool
 }
-
-type ParseMode int
-
-const (
-	ParseFull   ParseMode = iota // up / sync
-	ParseNoPeer                  // down
-)
 
 func newConfig() *Config {
 	return &Config{
@@ -70,7 +78,6 @@ func newConfig() *Config {
 }
 
 var _ encoding.TextMarshaler = (*Config)(nil)
-var _ encoding.TextUnmarshaler = (*Config)(nil)
 
 func (cfg *Config) String() string {
 	b, err := cfg.MarshalText()
@@ -88,9 +95,28 @@ func toSeconds(duration time.Duration) int {
 	return int(duration / time.Second)
 }
 
+func tableString(table *int) string {
+	if table == nil {
+		return "off"
+	}
+	return strconv.Itoa(*table)
+}
+
+func fwmarkString(mark *int) string {
+	if mark == nil {
+		return ""
+	}
+	if *mark == 0 {
+		return "off"
+	}
+	return strconv.Itoa(*mark)
+}
+
 var funcMap = template.FuncMap(map[string]interface{}{
-	"wgKey":     serializeKey,
-	"toSeconds": toSeconds,
+	"wgKey":        serializeKey,
+	"toSeconds":    toSeconds,
+	"tableString":  tableString,
+	"fwmarkString": fwmarkString,
 })
 
 var cfgTemplate = template.Must(
@@ -107,6 +133,7 @@ func (cfg *Config) MarshalText() (text []byte, err error) {
 	return buff.Bytes(), nil
 }
 
+// wireguard 允许写多条 up/down 脚本，所以修改 if 为 range，为模板产生多行切片内容
 const wgtypeTemplateSpec = `[Interface]
 {{- range .Address }}
 Address = {{ . }}
@@ -116,12 +143,14 @@ DNS = {{ . }}
 {{- end }}
 PrivateKey = {{ .PrivateKey | wgKey }}
 {{- if .ListenPort }}{{ "\n" }}ListenPort = {{ .ListenPort }}{{ end }}
-{{- if .MTU }}{{ "\n" }}MTU = {{ .MTU }}{{ end }}
-{{- if .Table }}{{ "\n" }}Table = {{ .Table }}{{ end }}
-{{- if .PreUp }}{{ "\n" }}PreUp = {{ .PreUp }}{{ end }}
-{{- if .PostUp }}{{ "\n" }}PostUp = {{ .PostUp }}{{ end }}
-{{- if .PreDown }}{{ "\n" }}PreDown = {{ .PreDown }}{{ end }}
-{{- if .PostDown }}{{ "\n" }}PostDown = {{ .PostDown }}{{ end }}
+{{- if .FirewallMark }}{{ "\n" }}FwMark = {{ .FirewallMark | fwmarkString }}{{ end }}
+{{- if .MTUSet }}{{ "\n" }}MTU = {{ .MTU }}{{ end }}
+{{- if .TableSet }}{{ "\n" }}Table = {{ .Table | tableString }}{{ end }}
+{{- if .WgBin }}{{ "\n" }}WgBin = {{ .WgBin }}{{ end }}
+{{- range .PreUp }}{{ "\n" }}PreUp = {{ . }}{{ end }}
+{{- range .PostUp }}{{ "\n" }}PostUp = {{ . }}{{ end }}
+{{- range .PreDown }}{{ "\n" }}PreDown = {{ . }}{{ end }}
+{{- range .PostDown }}{{ "\n" }}PostDown = {{ . }}{{ end }}
 {{- range .Peers }}
 {{- "\n" }}
 [Peer]
@@ -152,11 +181,47 @@ const (
 	peer               = iota
 )
 
-func (cfg *Config) UnmarshalText(text []byte) error {
-	*cfg = *newConfig() // Zero out the config
+// 保存一行命令的行号、key、value
+type configEntry struct {
+	line  int
+	key   string
+	value string
+}
+
+// 分区域保存配置文件每行的内容
+type configSections struct {
+	interfaceEntries []configEntry
+	peerSections     [][]configEntry
+}
+
+type peerEndpoint struct {
+	peerIndex int
+	raw       string
+}
+
+func (cfg *Config) setConfigText(text []byte) {
+	next := newConfig()
+	next.configText = append([]byte(nil), text...)
+	*cfg = *next
+}
+
+// 工具函数，确保在解析具体配置前已经解析过 key = value 的内容
+func (cfg *Config) ensureConfigScanned() error {
+	if cfg.configScanned {
+		return nil
+	}
+	if cfg.configText == nil {
+		return fmt.Errorf("config text is not set")
+	}
+	return cfg.scanConfig()
+}
+
+// 扫描一遍配置文件，按 [Interface] 和 [Peer] 分区保存每行的内容。
+// 函数只要求配置文件符合 key = value 的格式，具体的合法性检查交给各区域的解析函数
+func (cfg *Config) scanConfig() error {
+	var sections configSections
 	state := unknown
-	var peerCfg *wgtypes.PeerConfig
-	for no, line := range strings.Split(string(text), "\n") {
+	for no, line := range strings.Split(string(cfg.configText), "\n") {
 		line, _, _ = strings.Cut(line, "#")
 		ln := strings.TrimSpace(line)
 		if len(ln) == 0 {
@@ -165,196 +230,198 @@ func (cfg *Config) UnmarshalText(text []byte) error {
 		switch ln {
 		case "[Interface]":
 			state = inter
+			continue
 		case "[Peer]":
 			state = peer
-			cfg.Peers = append(cfg.Peers, wgtypes.PeerConfig{})
-			peerCfg = &cfg.Peers[len(cfg.Peers)-1]
+			sections.peerSections = append(sections.peerSections, nil) // 为每个 Peer 区域创建一个新的切片
+			continue
 		default:
-			parts := strings.Split(ln, "=")
-			if len(parts) < 2 {
-				return fmt.Errorf("cannot parse line %d, missing =", no)
+			lhs, rhs, found := strings.Cut(ln, "=")
+			if !found { // 不符合 key = value 的格式，直接报错
+				return fmt.Errorf("cannot parse line %d, missing =", no+1)
 			}
-			lhs := strings.TrimSpace(parts[0])
-			rhs := strings.TrimSpace(strings.Join(parts[1:], "="))
+			entry := configEntry{
+				line:  no + 1,
+				key:   strings.TrimSpace(lhs),
+				value: strings.TrimSpace(rhs),
+			}
 
 			switch state {
 			case inter:
-				if err := parseInterfaceLine(cfg, lhs, rhs); err != nil {
-					return fmt.Errorf("[line %d]: %v", no+1, err)
-				}
+				sections.interfaceEntries = append(sections.interfaceEntries, entry)
 			case peer:
-				if err := parsePeerLine(peerCfg, lhs, rhs); err != nil {
-					return fmt.Errorf("[line %d]: %v", no+1, err)
-				}
+				last := len(sections.peerSections) - 1
+				sections.peerSections[last] = append(sections.peerSections[last], entry)
 			default:
 				return fmt.Errorf("[line %d] cannot parse, unknown state", no+1)
 			}
 		}
 	}
+
+	cfg.configText = nil
+	cfg.configScanned = true
+	cfg.interfaceEntries = sections.interfaceEntries
+	cfg.peerSections = sections.peerSections
 	return nil
 }
 
-func (cfg *Config) UnmarshalTextNoPeer(text []byte) error {
-	*cfg = *newConfig() // Zero out the config
-	state := unknown
-	for no, line := range strings.Split(string(text), "\n") {
-		line, _, _ = strings.Cut(line, "#")
-		ln := strings.TrimSpace(line)
-		if len(ln) == 0 {
-			continue
-		}
-		switch ln {
-		case "[Interface]":
-			state = inter
-		case "[Peer]":
-			state = peer
-			continue
-			//skip
-		default:
-			parts := strings.Split(ln, "=")
-			if len(parts) < 2 {
-				return fmt.Errorf("cannot parse line %d, missing =", no)
-			}
-			lhs := strings.TrimSpace(parts[0])
-			rhs := strings.TrimSpace(strings.Join(parts[1:], "="))
+// 从 interfaceEntries 解析 [Interface] 区域的配置，解析成功后 interfaceEntries 清空，interfaceLoaded 置为 true
+func (cfg *Config) ParseInterface() error {
+	if err := cfg.ensureConfigScanned(); err != nil {
+		return err
+	}
+	if cfg.interfaceLoaded {
+		return nil
+	}
 
-			switch state {
-			case inter:
-				if err := parseInterfaceLine(cfg, lhs, rhs); err != nil {
-					return fmt.Errorf("[line %d]: %v", no+1, err)
-				}
-			case peer:
-				// skip
-				continue
-			default:
-				return fmt.Errorf("[line %d] cannot parse, unknown state", no+1)
+	next := *cfg
+	for _, entry := range cfg.interfaceEntries {
+		if err := parseInterfaceLine(&next, entry.key, entry.value); err != nil {
+			return fmt.Errorf("[line %d]: %v", entry.line, err)
+		}
+	}
+	next.interfaceEntries = nil
+	next.interfaceLoaded = true
+	*cfg = next
+	return nil
+}
+
+// 从 peerSections 解析 [Peer] 区域的配置，解析成功后 peerSections 清空，peersLoaded 置为 true
+func (cfg *Config) LoadPeers() error {
+	if err := cfg.ensureConfigScanned(); err != nil {
+		return err
+	}
+	if cfg.peersLoaded {
+		return nil
+	}
+	if cfg.peerSections == nil {
+		cfg.peersLoaded = true
+		return nil
+	}
+
+	peers := make([]wgtypes.PeerConfig, 0, len(cfg.peerSections))
+	peerEndpoints := make(map[wgtypes.Key]peerEndpoint)
+
+	for peerIndex, section := range cfg.peerSections {
+		var peerCfg wgtypes.PeerConfig
+		var rawEndpoint string
+
+		for _, entry := range section {
+			if err := parsePeerLine(&peerCfg, entry.key, entry.value, &rawEndpoint); err != nil {
+				return fmt.Errorf("[line %d]: %v", entry.line, err)
 			}
+		}
+		peers = append(peers, peerCfg)
+		if rawEndpoint != "" {
+			peerEndpoints[peerCfg.PublicKey] = peerEndpoint{peerIndex: peerIndex, raw: rawEndpoint}
+		}
+	}
+
+	cfg.Peers = peers
+	cfg.peerEndpoints = peerEndpoints
+	cfg.peerSections = nil
+	cfg.peersLoaded = true
+	return nil
+}
+
+// 将 peerEndpoints 中的 endpoint 解析为 net.UDPAddr，解析成功后按记录的下标写入 Peers
+func (cfg *Config) ResolveEndpoints() error {
+	if !cfg.peersLoaded {
+		return fmt.Errorf("peers must be loaded before resolving endpoints")
+	}
+	for key := range cfg.peerEndpoints {
+		if err := cfg.ResolveEndpoint(key); err != nil {
+			log.Warn().Err(err).Str("peer", key.String()).Msg("resolve endpoint")
 		}
 	}
 	return nil
 }
 
-func MatchConfig(pattern string, mode ParseMode) map[string]*Config {
+// 根据 key 找出对应 peer 的原始 endpoint 字符串，解析为 net.UDPAddr 并写入 Peers。
+// 由于该函数被 DDNS 调用，而运行时配置只能拿到 peer key，所以函数签名与批量解析不同
+func (cfg *Config) ResolveEndpoint(key wgtypes.Key) error {
+	if !cfg.peersLoaded {
+		return fmt.Errorf("peers must be loaded before resolving endpoints")
+	}
+	endpoint, ok := cfg.peerEndpoints[key]
+	if !ok {
+		return nil
+	}
+	if endpoint.peerIndex < 0 || endpoint.peerIndex >= len(cfg.Peers) {
+		return fmt.Errorf("peer %s has invalid index %d", key, endpoint.peerIndex)
+	}
+	if cfg.Peers[endpoint.peerIndex].PublicKey != key {
+		return fmt.Errorf("peer %s does not match index %d", key, endpoint.peerIndex)
+	}
+
+	addr, err := dns.ResolveUDPAddrImpl("", endpoint.raw)
+	if err != nil {
+		return err
+	}
+	cfg.Peers[endpoint.peerIndex].Endpoint = addr
+	return nil
+}
+
+// 返回一个 map，key 为 peer 的 PublicKey，value 为原始 endpoint 字符串
+func (cfg *Config) UnresolvedEndpoints() map[wgtypes.Key]string {
+	result := make(map[wgtypes.Key]string, len(cfg.peerEndpoints))
+	for key, endpoint := range cfg.peerEndpoints {
+		result[key] = endpoint.raw
+	}
+	return result
+}
+
+// 从正则表达式加载一组匹配的配置文件，返回一个 map，key 为配置文件名，value 为解析后的 Config
+func LoadMatchingConfigs(pattern string) (map[string]*Config, error) {
 	if !strings.HasPrefix(pattern, "^") {
 		pattern = "^" + pattern
 	}
 	if !strings.HasSuffix(pattern, "$") {
 		pattern = pattern + "$"
 	}
-
-	files, err := os.ReadDir("/etc/wireguard")
+	matcher, err := regexp.Compile(pattern)
 	if err != nil {
-		log.Fatal().Err(err).Msg("cannot read /etc/wireguard")
-		return nil
+		return nil, fmt.Errorf("invalid interface pattern %q: %w", pattern, err)
 	}
 
-	var cfgs = make(map[string]*Config)
+	files, err := os.ReadDir(wireguardConfigDir)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read config directory: %w", err)
+	}
+
+	cfgs := make(map[string]*Config)
+	var loadErrors []error
 	for _, file := range files {
-		if len(file.Name()) < 6 || strings.LastIndex(file.Name(), ".conf") != len(file.Name())-5 {
+		if !strings.HasSuffix(file.Name(), ".conf") {
 			continue
 		}
-		matched, err := regexp.Match(pattern, []byte(file.Name()[:len(file.Name())-5]))
-		if err != nil {
-			log.Fatal().Err(err).Msg("cannot match pattern")
-			return nil
+		name := strings.TrimSuffix(file.Name(), ".conf")
+		if !matcher.MatchString(name) {
+			continue
 		}
-		if matched {
-			b, err := os.ReadFile(filepath.Join("/etc/wireguard/" + file.Name()))
-			if err != nil {
-				log.Fatal().Err(err).Msg("cannot read file")
-			}
-			c := &Config{}
 
-			switch mode {
-			case ParseNoPeer:
-				if err := c.UnmarshalTextNoPeer(b); err != nil {
-					log.Err(err).
-						Str("file", file.Name()).
-						Msg("cannot parse config file (lite)")
-					continue
-				}
-			case ParseFull:
-				if err := c.UnmarshalText(b); err != nil {
-					log.Err(err).
-						Str("file", file.Name()).
-						Msg("cannot parse config file")
-					continue
-				}
-			}
-			cfgs[file.Name()[:len(file.Name())-5]] = c
+		cfg, err := LoadConfig(name)
+		if err != nil {
+			loadErrors = append(loadErrors, fmt.Errorf("%s: %w", file.Name(), err))
+			continue
 		}
+		cfgs[name] = cfg
 	}
-	return cfgs
+	return cfgs, errors.Join(loadErrors...)
 }
 
-func GetConfig(name string) (*Config, error) {
-	b, err := os.ReadFile(filepath.Join("/etc/wireguard/" + name + ".conf"))
+// 加载单个配置，默认只解析 interface 区域
+func LoadConfig(name string) (*Config, error) {
+	b, err := os.ReadFile(filepath.Join(wireguardConfigDir, name+".conf"))
 	if err != nil {
-		return nil, fmt.Errorf("cannot read file:%v", err)
+		return nil, fmt.Errorf("cannot read file: %w", err)
 	}
 	c := &Config{}
-	if err := c.UnmarshalText(b); err != nil {
-		return nil, fmt.Errorf("cannot parse config file:%v", err)
+	c.setConfigText(b)
+	if err := c.ParseInterface(); err != nil {
+		return nil, fmt.Errorf("cannot parse interface config: %w", err)
 	}
 	return c, nil
-}
-
-func GetUnresolvedEndpoints(name string) (map[wgtypes.Key]string, error) {
-	b, err := os.ReadFile(filepath.Join("/etc/wireguard/" + name + ".conf"))
-	if err != nil {
-		return nil, fmt.Errorf("cannot read file:%v", err)
-	}
-	state := unknown
-	var endpoint string
-	var pubkey string
-	unresolvedEndpoints := make(map[wgtypes.Key]string)
-	for no, line := range strings.Split(string(b), "\n") {
-		ln := strings.TrimSpace(line)
-		if len(ln) == 0 || ln[0] == '#' {
-			continue
-		}
-		switch ln {
-		case "[Interface]":
-			state = inter
-			continue
-		case "[Peer]":
-			state = peer
-			pubkey = ""
-			endpoint = ""
-			continue
-		}
-
-		if state != peer {
-			continue
-		}
-
-		parts := strings.Split(ln, "=")
-		if len(parts) < 2 {
-			return nil, fmt.Errorf("cannot parse line %d, missing =", no)
-		}
-		lhs := strings.TrimSpace(parts[0])
-		rhs := strings.TrimSpace(strings.Join(parts[1:], "="))
-
-		switch lhs {
-		case "PublicKey":
-			pubkey = rhs
-		case "Endpoint":
-			endpoint = rhs
-		}
-
-		if pubkey == "" || endpoint == "" {
-			continue
-		}
-
-		key, err := wgtypes.ParseKey(pubkey)
-		if err != nil {
-			return nil, fmt.Errorf("cannot parse key:%v", err)
-		}
-		unresolvedEndpoints[key] = endpoint
-		pubkey = ""
-		endpoint = ""
-	}
-	return unresolvedEndpoints, nil
 }
 
 func parseInterfaceLine(cfg *Config, lhs string, rhs string) error {
@@ -381,6 +448,7 @@ func parseInterfaceLine(cfg *Config, lhs string, rhs string) error {
 			return err
 		}
 		cfg.MTU = int(mtu)
+		cfg.MTUSet = true
 	case "Table":
 		if strings.ToLower(rhs) == "off" {
 			cfg.Table = nil
@@ -392,6 +460,7 @@ func parseInterfaceLine(cfg *Config, lhs string, rhs string) error {
 		}
 		inttbl := int(tbl)
 		cfg.Table = &inttbl
+		cfg.TableSet = true
 	case "ListenPort":
 		portI64, err := strconv.ParseInt(rhs, 10, 64)
 		if err != nil {
@@ -407,6 +476,10 @@ func parseInterfaceLine(cfg *Config, lhs string, rhs string) error {
 		cfg.PreDown = append(cfg.PreDown, rhs)
 	case "PostDown":
 		cfg.PostDown = append(cfg.PostDown, rhs)
+	case "SaveConfig":
+		if _, err := strconv.ParseBool(rhs); err != nil {
+			return err
+		}
 	case "PrivateKey":
 		key, err := ParseKey(rhs)
 		if err != nil {
@@ -417,7 +490,8 @@ func parseInterfaceLine(cfg *Config, lhs string, rhs string) error {
 		cfg.WgBin = rhs
 	case "FwMark":
 		if strings.ToLower(rhs) == "off" {
-			cfg.FirewallMark = nil
+			mark := 0
+			cfg.FirewallMark = &mark
 			return nil
 		}
 		mark64, err := strconv.ParseInt(rhs, 0, 64)
@@ -432,7 +506,7 @@ func parseInterfaceLine(cfg *Config, lhs string, rhs string) error {
 	return nil
 }
 
-func parsePeerLine(peerCfg *wgtypes.PeerConfig, lhs string, rhs string) error {
+func parsePeerLine(peerCfg *wgtypes.PeerConfig, lhs string, rhs string, rawEndpoint *string) error {
 	switch lhs {
 	case "PublicKey":
 		key, err := ParseKey(rhs)
@@ -458,12 +532,7 @@ func parsePeerLine(peerCfg *wgtypes.PeerConfig, lhs string, rhs string) error {
 			peerCfg.AllowedIPs = append(peerCfg.AllowedIPs, net.IPNet{IP: ip, Mask: cidr.Mask})
 		}
 	case "Endpoint":
-		addr, err := dns.ResolveUDPAddr("", rhs)
-		if err != nil {
-			log.Warn().Err(err).Msg("resolve endpoint")
-			return nil
-		}
-		peerCfg.Endpoint = addr
+		*rawEndpoint = rhs
 	case "PersistentKeepalive":
 		t, err := strconv.ParseInt(rhs, 10, 64)
 		if err != nil {

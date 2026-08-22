@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/dn-11/wg-quick-op/conf"
-	"github.com/dn-11/wg-quick-op/lib/dns"
 	"github.com/dn-11/wg-quick-op/quick"
 	"github.com/dn-11/wg-quick-op/utils"
 	"github.com/rs/zerolog/log"
@@ -54,7 +53,7 @@ func (d *daemon) Run() {
 			wgUnLink := false
 
 			for _, peer := range peers {
-				endpoint, ok := iface.unresolvedEndpoints[peer.PublicKey]
+				_, ok := iface.unresolvedEndpoints[peer.PublicKey]
 				if !ok {
 					log.Debug().Str("iface", iface.name).Str("peer", peer.PublicKey.String()).Msg("peer endpoint is nil, skip it")
 					continue
@@ -65,17 +64,10 @@ func (d *daemon) Run() {
 				}
 				log.Debug().Str("iface", iface.name).Str("peer", peer.PublicKey.String()).Msg("peer handshake timeout")
 				wgUnLink = true
-				addr, err := dns.ResolveUDPAddr("", endpoint)
+				err := iface.cfg.ResolveEndpoint(peer.PublicKey)
 				if err != nil {
 					log.Err(err).Str("iface", iface.name).Str("peer", peer.PublicKey.String()).Msg("failed to resolve endpoint")
 					continue
-				}
-
-				for i, v := range iface.cfg.Peers {
-					if v.PublicKey == peer.PublicKey && (peer.Endpoint == nil || !peer.Endpoint.IP.Equal(addr.IP)) {
-						iface.cfg.Peers[i].Endpoint = addr
-						break
-					}
 				}
 			}
 

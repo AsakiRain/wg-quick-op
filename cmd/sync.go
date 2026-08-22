@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"github.com/dn-11/wg-quick-op/lib/dns"
 	"github.com/dn-11/wg-quick-op/quick"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
@@ -14,10 +15,16 @@ var syncCmd = &cobra.Command{
 it may result in address added by PostUp being deleted.'`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if len(args) != 1 {
-			log.Error().Msg("up command requires exactly one interface name")
+			log.Error().Msg("sync command requires exactly one interface name or regular expression")
 			return
 		}
-		cfgs := quick.MatchConfig(args[0], quick.ParseFull)
+		cfgs, err := quick.LoadMatchingConfigs(args[0])
+		if err != nil {
+			log.Err(err).Msg("failed to load matching configs")
+		}
+		if len(cfgs) > 0 {
+			dns.Init()
+		}
 		for iface, cfg := range cfgs {
 			err := quick.Sync(cfg, iface, log.With().Str("iface", iface).Logger())
 			if err != nil {

@@ -1,8 +1,10 @@
 [log]
-# Log level of the program
+# Log levels for the background service and interactive CLI commands
 # Valid: trace, debug, info, warn, error, fatal, panic
 # Default: info (used when omitted or invalid)
-level = "error"
+service_log_level = "error"
+cli_log_level = "info"
+# Legacy `level` is still accepted as a fallback setting.
 
 [start_on_boot]
 enabled = true
@@ -16,6 +18,8 @@ skip_ifaces = []
 enabled = true
 # only query A records and ignore IPv6 DNS resolvers/AAAA records
 ipv4_only = false
+# maximum number of CNAME records followed during direct resolution
+max_cname_depth = 5
 # fetch ROA, config for direct_resolver
 roa_finder = [ "223.5.5.5", "119.29.29.29" ]
 
