@@ -384,30 +384,43 @@ func LoadMatchingConfigs(pattern string) (map[string]*Config, error) {
 		return nil, fmt.Errorf("invalid interface pattern %q: %w", pattern, err)
 	}
 
-	files, err := os.ReadDir(wireguardConfigDir)
+	names, err := ListConfigNames()
 	if err != nil {
-		return nil, fmt.Errorf("cannot read config directory: %w", err)
+		return nil, err
 	}
 
 	cfgs := make(map[string]*Config)
 	var loadErrors []error
-	for _, file := range files {
-		if !strings.HasSuffix(file.Name(), ".conf") {
-			continue
-		}
-		name := strings.TrimSuffix(file.Name(), ".conf")
+	for _, name := range names {
 		if !matcher.MatchString(name) {
 			continue
 		}
 
 		cfg, err := LoadConfig(name)
 		if err != nil {
-			loadErrors = append(loadErrors, fmt.Errorf("%s: %w", file.Name(), err))
+			loadErrors = append(loadErrors, fmt.Errorf("%s.conf: %w", name, err))
 			continue
 		}
 		cfgs[name] = cfg
 	}
 	return cfgs, errors.Join(loadErrors...)
+}
+
+// 列出配置目录中的接口名，不读取或解析配置文件内容
+func ListConfigNames() ([]string, error) {
+	files, err := os.ReadDir(wireguardConfigDir)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read config directory: %w", err)
+	}
+
+	names := make([]string, 0, len(files))
+	for _, file := range files {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), ".conf") {
+			continue
+		}
+		names = append(names, strings.TrimSuffix(file.Name(), ".conf"))
+	}
+	return names, nil
 }
 
 // 加载单个配置，默认只解析 interface 区域

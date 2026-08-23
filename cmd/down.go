@@ -8,8 +8,9 @@ import (
 
 // downCmd represents the down command
 var downCmd = &cobra.Command{
-	Use:   "down",
-	Short: "down [interface name]",
+	Use:               "down",
+	Short:             "down [interface name]",
+	ValidArgsFunction: completeInterfaceNames,
 	Run: func(cmd *cobra.Command, args []string) {
 		if len(args) != 1 {
 			log.Error().Msg("down command requires exactly one interface name or regular expression")

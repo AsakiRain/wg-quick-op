@@ -27,6 +27,12 @@ func Execute() {
 func init() {
 	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "Verbose output")
 	rootCmd.PersistentPreRun = func(cmd *cobra.Command, args []string) {
+		// 补全只需要读取配置文件名，不初始化运行时配置
+		for current := cmd; current != nil; current = current.Parent() {
+			if current.Name() == "completion" || current.Name() == cobra.ShellCompRequestCmd || current.Name() == cobra.ShellCompNoDescRequestCmd {
+				return
+			}
+		}
 		verbose, _ := cmd.Flags().GetBool("verbose")
 		// 根据命令类型设置运行模式
 		mode := conf.RuntimeCLI

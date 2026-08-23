@@ -9,8 +9,9 @@ import (
 
 // upCmd represents the up command
 var upCmd = &cobra.Command{
-	Use:   "up",
-	Short: "up [interface name]",
+	Use:               "up",
+	Short:             "up [interface name]",
+	ValidArgsFunction: completeInterfaceNames,
 	Long: `up [interface name] 
 interface should be defined in /etc/wireguard/<interface name>.conf
 regexp in supported, match interface with ^<input>$ by default

@@ -142,6 +142,22 @@ func TestLoadMatchingConfigs(t *testing.T) {
 	require.Len(t, cfgs, 1)
 }
 
+// 验证接口名枚举只返回配置文件，不读取文件内容，并忽略同名目录和其他后缀
+func TestListConfigNames(t *testing.T) {
+	oldConfigDir := wireguardConfigDir
+	wireguardConfigDir = t.TempDir()
+	t.Cleanup(func() { wireguardConfigDir = oldConfigDir })
+
+	require.NoError(t, os.WriteFile(filepath.Join(wireguardConfigDir, "wg-two.conf"), nil, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(wireguardConfigDir, "notes.txt"), nil, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(wireguardConfigDir, "wg-one.conf"), []byte("invalid"), 0o600))
+	require.NoError(t, os.Mkdir(filepath.Join(wireguardConfigDir, "directory.conf"), 0o700))
+
+	names, err := ListConfigNames()
+	require.NoError(t, err)
+	assert.Equal(t, []string{"wg-one", "wg-two"}, names)
+}
+
 // 验证 ParseInterface 不加载 Peer，LoadPeers 不解析 Endpoint，DNS 查询只在 ResolveEndpoints 时发生
 func TestInterfaceParsingDefersPeerAndEndpointResolution(t *testing.T) {
 	oldResolver := libdns.ResolveUDPAddrImpl

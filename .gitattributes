@@ -1,0 +1,2 @@
+daemon/wg-quick-op text eol=lf
+daemon/wg-quick-op-systemd text eol=lf

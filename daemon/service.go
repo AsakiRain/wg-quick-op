@@ -12,7 +12,6 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"os"
-	"os/exec"
 )
 
 const InitdServicePath = "/etc/init.d/wg-quick-op"
@@ -72,12 +71,12 @@ func startOnBoot() {
 }
 
 func AddService() {
-	_, err := exec.LookPath("wg-quick-op")
-	if err != nil {
-		if !errors.Is(err, exec.ErrDot) {
-			log.Err(err).Msgf("look up wg-quick-up failed")
+	if _, err := os.Stat(installed); err != nil {
+		if !os.IsNotExist(err) {
+			log.Err(err).Str("path", installed).Msg("get installed binary stat failed")
+			return
 		}
-		log.Warn().Msg("wg-quick-op hasn't been installed to path, let's turn to install it")
+		log.Warn().Msgf("wg-quick-op hasn't been installed to %s, installing it now", installed)
 		Install()
 	}
 	if isSystemd {

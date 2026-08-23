@@ -12,6 +12,7 @@ var uninstallCmd = &cobra.Command{
 	Short: "uninstall wg-quick-op from /usr/sbin/wg-quick-op",
 	Run: func(cmd *cobra.Command, args []string) {
 		daemon.RmService()
+		uninstallBashCompletion()
 		daemon.Uninstall()
 	},
 }

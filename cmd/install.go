@@ -12,6 +12,7 @@ var installCmd = &cobra.Command{
 	Short: "install wg-quick-op to /usr/sbin/wg-quick-op",
 	Run: func(cmd *cobra.Command, args []string) {
 		daemon.Install()
+		installBashCompletion()
 		daemon.AddService()
 	},
 }

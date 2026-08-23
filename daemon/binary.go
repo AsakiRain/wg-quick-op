@@ -40,7 +40,7 @@ func Install() {
 			return
 		}
 	} else {
-		if err := os.RemoveAll(installed); err != nil {
+		if err := os.Remove(installed); err != nil {
 			log.Err(err).Msgf("remove old binary failed")
 			return
 		}
@@ -54,27 +54,36 @@ func Install() {
 	defer fp.Close()
 	_, err = io.Copy(fp, originFp)
 	if err != nil {
-		_ = os.RemoveAll(installed)
+		_ = os.Remove(installed)
 		log.Err(err).Msgf("copy binary to %s", installed)
 		return
 	}
 	log.Info().Msgf("installed wg-quick-op to %s", installed)
+
+	installedDir := filepath.Dir(installed)
+	if !pathContainsDir(os.Getenv("PATH"), installedDir) {
+		log.Warn().Str("directory", installedDir).Msg("installation directory is not in $PATH")
+	}
+}
+
+func pathContainsDir(pathValue string, target string) bool {
+	target = filepath.Clean(target)
+	for _, dir := range filepath.SplitList(pathValue) {
+		if filepath.Clean(dir) == target {
+			return true
+		}
+	}
+	return false
 }
 
 func Uninstall() {
-	file, err := exec.LookPath("wg-quick-op")
-	if err != nil {
-		if errors.Is(err, exec.ErrNotFound) || os.IsNotExist(err) {
-			log.Info().Msg("wg-quick-op binary not found in $PATH, nothing to do")
-		} else {
-			log.Err(err).Msg("find wg-quick-op binary failed")
+	if err := os.Remove(installed); err != nil {
+		if os.IsNotExist(err) {
+			log.Info().Msgf("wg-quick-op binary not found at %s, nothing to do", installed)
+			return
 		}
+		log.Err(err).Str("path", installed).Msg("remove wg-quick-op binary failed")
 		return
 	}
-
-	if err := os.RemoveAll(file); err != nil {
-		log.Err(err).Str("path", file).Msg("remove wg-quick-op binary failed")
-		return
-	}
-	log.Info().Msgf("removed wg-quick-op from %s", file)
+	log.Info().Msgf("removed wg-quick-op from %s", installed)
 }

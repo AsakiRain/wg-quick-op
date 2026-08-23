@@ -9,8 +9,9 @@ import (
 
 // syncCmd represents the sync command
 var syncCmd = &cobra.Command{
-	Use:   "sync (deprecated)",
-	Short: "sync [interface name]",
+	Use:               "sync (deprecated)",
+	Short:             "sync [interface name]",
+	ValidArgsFunction: completeInterfaceNames,
 	Long: `sync [interface name], sync link,address,device and route. Notice that PostUp and PreUp won't run
 it may result in address added by PostUp being deleted.'`,
 	Run: func(cmd *cobra.Command, args []string) {

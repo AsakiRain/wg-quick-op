@@ -9,9 +9,10 @@ import (
 
 // bounceCmd represents the bounce command
 var bounceCmd = &cobra.Command{
-	Use:   "bounce",
-	Short: "down and then up the interface",
-	Long:  `down and then up the interface,if the interface is not up, it will up the interface.`,
+	Use:               "bounce",
+	Short:             "down and then up the interface",
+	Long:              `down and then up the interface,if the interface is not up, it will up the interface.`,
+	ValidArgsFunction: completeInterfaceNames,
 	Run: func(cmd *cobra.Command, args []string) {
 		if len(args) != 1 {
 			log.Error().Msg("bounce command requires exactly one interface name or regular expression")
