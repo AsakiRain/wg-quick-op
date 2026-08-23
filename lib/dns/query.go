@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"strconv"
 	"sync"
@@ -52,10 +53,26 @@ func addrPortStrings(addrs []netip.AddrPort) []string {
 	return result
 }
 
-func rrStrings(records []dns.RR) []string {
+// rrSummaries 提取记录类型和有效载荷，避免 trace 日志重复输出 TTL、Class 和 EDNS 伪记录。
+func rrSummaries(records []dns.RR) []string {
 	result := make([]string, 0, len(records))
 	for _, record := range records {
-		result = append(result, record.String())
+		switch rr := record.(type) {
+		case *dns.A:
+			result = append(result, "A "+rr.A.String())
+		case *dns.AAAA:
+			result = append(result, "AAAA "+rr.AAAA.String())
+		case *dns.CNAME:
+			result = append(result, "CNAME "+rr.Target)
+		case *dns.NS:
+			result = append(result, "NS "+rr.Ns)
+		case *dns.SOA:
+			result = append(result, "SOA "+rr.Hdr.Name+" "+rr.Ns)
+		case *dns.OPT:
+			continue
+		default:
+			result = append(result, dnsTypeName(record.Header().Rrtype)+" "+record.Header().Name)
+		}
 	}
 	return result
 }
@@ -85,30 +102,40 @@ func queryWithRetry(ctx context.Context, domain string, qType uint16, server net
 		var rtt time.Duration
 		rec, rtt, err = defaultDNSClient.QueryDNS(ctx, msg, server.String())
 		if err != nil { // 发送 DNS 请求失败，交给 GoRetryCtx 重试。
-			log.Warn().Str("domain", domain).Err(err).Str("server", server.String()).Msg("DNS lookup failed")
 			return err
 		}
 
-		log.Trace().
+		responseLog := log.Trace().
 			Str("domain", domain).
 			Str("query_type", dnsTypeName(qType)).
 			Str("server", server.String()).
 			Int("attempt", attempt).
 			Dur("rtt", rtt).
-			Str("rcode", dns.RcodeToString[rec.Rcode]).
-			Bool("truncated", rec.Truncated).
-			Strs("answer", rrStrings(rec.Answer)).
-			Strs("authority", rrStrings(rec.Ns)).
-			Strs("additional", rrStrings(rec.Extra)).
-			Msg("DNS query response")
+			Str("rcode", dns.RcodeToString[rec.Rcode])
+		if answers := rrSummaries(rec.Answer); len(answers) > 0 {
+			responseLog.Strs("answers", answers)
+		}
+		if authority := rrSummaries(rec.Ns); len(authority) > 0 {
+			responseLog.Strs("authority", authority)
+		}
+		if additional := rrSummaries(rec.Extra); len(additional) > 0 {
+			responseLog.Strs("additional", additional)
+		}
+		if rec.Truncated {
+			responseLog.Bool("truncated", true)
+		}
+		responseLog.Msg("DNS response")
 
 		if rec.Rcode != dns.RcodeSuccess { // DNS 服务器返回了非成功响应码（例如 NXDOMAIN），封装为 dnsRcodeError，并不再重试
 			responseErr = &dnsRcodeError{domain: domain, queryType: qType, server: server, rcode: rec.Rcode}
-			log.Warn().Err(responseErr).Msg("DNS server returned failure response")
+			log.Debug().Err(responseErr).Msg("DNS server returned failure response")
 		}
 		return nil // 正常完成DNS请求，不再重试
 	})
 	if err != nil { // GoRetryCtx 超过重试次数仍然失败，返回最后一次的错误。
+		if !errors.Is(err, context.Canceled) {
+			log.Debug().Err(err).Str("domain", domain).Str("query_type", dnsTypeName(qType)).Str("server", server.String()).Int("attempts", attempt).Msg("DNS query retries exhausted")
+		}
 		return nil, err
 	}
 	if responseErr != nil { // DNS 请求成功，但服务器返回非成功响应码，返回封装的 dnsRcodeError。
@@ -120,11 +147,11 @@ func queryWithRetry(ctx context.Context, domain string, qType uint16, server net
 // queryWithRetryWithList 按顺序尝试 dnsList 中的 DNS 服务器。
 // 每个服务器内部由 queryWithRetry 负责传输失败重试；普通错误会继续尝试下一个服务器，
 func queryWithRetryWithList(ctx context.Context, domain string, qType uint16, dnsList []netip.AddrPort) (*dns.Msg, error) {
-	for _, s := range dnsList {
+	var lastErr error
+	for i, s := range dnsList {
 		msg, err := queryWithRetry(ctx, domain, qType, s)
 		if err != nil {
 			if errors.Is(err, context.Canceled) { // 对于上下文取消，立即返回，不再尝试其他服务器
-				log.Trace().Err(err).Str("domain", domain).Str("query_type", dnsTypeName(qType)).Str("server", s.String()).Msg("DNS query canceled; stop server iteration")
 				return nil, err
 			}
 			var rcodeErr *dnsRcodeError
@@ -132,12 +159,18 @@ func queryWithRetryWithList(ctx context.Context, domain string, qType uint16, dn
 				log.Trace().Err(err).Str("domain", domain).Str("query_type", dnsTypeName(qType)).Str("server", s.String()).Msg("Response NXDOMAIN; stop server iteration")
 				return nil, err
 			}
-			log.Debug().Err(err).Str("domain", domain).Str("server", s.String()).Msg("Failed to resolve")
+			lastErr = err
+			if i+1 < len(dnsList) {
+				log.Trace().Err(err).Str("domain", domain).Str("query_type", dnsTypeName(qType)).Str("server", s.String()).Str("next_server", dnsList[i+1].String()).Msg("Trying next DNS server")
+			}
 			continue
 		}
 		return msg, nil
 	}
-	return nil, errors.New("Failed to resolve with all server")
+	if lastErr == nil {
+		return nil, errors.New("no DNS servers configured")
+	}
+	return nil, fmt.Errorf("all DNS servers failed: %w", lastErr)
 }
 
 func queryAAndAAAAAddrIter(domain string, dnsList []netip.AddrPort) func(yield func(addr netip.Addr) bool) {
@@ -163,9 +196,6 @@ func queryAddrIter(domain string, dnsList []netip.AddrPort, queryTypes ...uint16
 			wg.Go(func() {
 				rec, err := queryWithRetryWithList(ctx, domain, queryType, dnsList)
 				if err != nil {
-					if !errors.Is(err, context.Canceled) {
-						log.Error().Err(err).Str("domain", domain).Str("query_type", dnsTypeName(queryType)).Strs("servers", addrPortStrings(dnsList)).Msg("DNS query failed")
-					}
 					return
 				}
 				select {
@@ -179,16 +209,7 @@ func queryAddrIter(domain string, dnsList []netip.AddrPort, queryTypes ...uint16
 			close(resultChan)
 		}()
 
-		responseCount := 0
-		addressCount := 0
 		for result := range resultChan {
-			log.Trace().
-				Str("domain", domain).
-				Str("query_type", dnsTypeName(result.queryType)).
-				Int("answer_count", len(result.msg.Answer)).
-				Msg("DNS address iterator processing completed response")
-
-			responseCount++
 			for _, rr := range result.msg.Answer {
 				switch rr := rr.(type) {
 				case *dns.A:
@@ -197,10 +218,7 @@ func queryAddrIter(domain string, dnsList []netip.AddrPort, queryTypes ...uint16
 						log.Warn().Str("rr", rr.String()).Msgf("Cannot convert dns response to netip")
 						continue
 					}
-					addressCount++
-					log.Trace().Str("domain", domain).Str("query_type", "A").Str("addr", addr.String()).Msg("DNS address iterator yield")
 					if !yield(addr) {
-						log.Trace().Str("domain", domain).Str("addr", addr.String()).Msg("DNS address iterator stopped by consumer")
 						return
 					}
 				case *dns.AAAA:
@@ -209,19 +227,11 @@ func queryAddrIter(domain string, dnsList []netip.AddrPort, queryTypes ...uint16
 						log.Warn().Str("rr", rr.String()).Msgf("Cannot convert dns response to netip")
 						continue
 					}
-					addressCount++
-					log.Trace().Str("domain", domain).Str("query_type", "AAAA").Str("addr", addr.String()).Msg("DNS address iterator yield")
 					if !yield(addr) {
-						log.Trace().Str("domain", domain).Str("addr", addr.String()).Msg("DNS address iterator stopped by consumer")
 						return
 					}
 				}
 			}
 		}
-		log.Trace().
-			Str("domain", domain).
-			Int("response_count", responseCount).
-			Int("address_count", addressCount).
-			Msg("DNS address iterator completed")
 	}
 }

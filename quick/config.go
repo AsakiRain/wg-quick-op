@@ -329,9 +329,12 @@ func (cfg *Config) ResolveEndpoints() error {
 	if !cfg.peersLoaded {
 		return fmt.Errorf("peers must be loaded before resolving endpoints")
 	}
-	for key := range cfg.peerEndpoints {
+	for key, endpoint := range cfg.peerEndpoints {
+		if endpoint.peerIndex < len(cfg.Peers) && cfg.Peers[endpoint.peerIndex].Endpoint != nil {
+			continue
+		}
 		if err := cfg.ResolveEndpoint(key); err != nil {
-			log.Warn().Err(err).Str("peer", key.String()).Msg("resolve endpoint")
+			log.Warn().Err(err).Str("peer", key.String()).Str("endpoint", endpoint.raw).Msg("failed to resolve peer endpoint")
 		}
 	}
 	return nil

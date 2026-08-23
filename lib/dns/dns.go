@@ -100,7 +100,6 @@ func parseDNSServer(server, defaultPort, source string) (netip.AddrPort, bool) {
 		log.Debug().Str("addr", address).Str("source", source).Msg("Skip IPv6 resolver in ipv4_only mode")
 		return netip.AddrPort{}, false
 	}
-	log.Trace().Str("addr", address).Str("source", source).Msg("Parsed DNS server")
 	return addrPort, true
 }
 
@@ -125,7 +124,6 @@ func ResolveUDPAddrDirect(_ string, addr string) (*net.UDPAddr, error) {
 		if err != nil {
 			return nil, fmt.Errorf("Resolve host direct failed: %w", err)
 		}
-		log.Trace().Str("endpoint", addr).Str("host", host).Str("resolved_ip", ip.String()).Int("port", numPort).Msg("Direct endpoint resolution succeeded")
 	}
 
 	return &net.UDPAddr{IP: net.IP(ip.AsSlice()).To16(), Port: numPort}, nil
@@ -133,28 +131,26 @@ func ResolveUDPAddrDirect(_ string, addr string) (*net.UDPAddr, error) {
 
 // 只接受不带端口的域名输入，返回 netip.Addr
 func resolveDomainDirect(host string) (netip.Addr, error) {
-	log.Trace().Str("domain", host).Msg("Direct authoritative DNS resolution start")
 	maxCnameDepth := conf.EnhancedDNS.DirectResolver.MaxCnameDepth
 	if maxCnameDepth <= 0 {
 		log.Warn().Int("max_cname_depth", maxCnameDepth).Msg("Invalid MaxCnameDepth, using default value 5")
 		maxCnameDepth = 5
 	}
-	domain, err := unfoldCNAME(dns.Fqdn(host), maxCnameDepth)
+	requestedDomain := dns.Fqdn(host)
+	domain, err := unfoldCNAME(requestedDomain, maxCnameDepth)
 	if err != nil {
 		return netip.Addr{}, err
 	}
-	log.Trace().Str("domain", domain).Msg("direct authoritative DNS canonical name selected")
-
 	if resolved := resolveFromAuthoritativeServers(domain); resolved.IsValid() {
+		log.Info().Str("domain", requestedDomain).Str("resolved_ip", resolved.String()).Str("source", "authoritative").Msg("DNS resolution succeeded")
 		return resolved, nil
 	}
 
-	log.Trace().Str("domain", domain).Strs("resolvers", addrPortStrings(publicDNS)).Msg("public DNS fallback start")
+	log.Debug().Str("domain", domain).Strs("resolvers", addrPortStrings(publicDNS)).Msg("Authoritative resolution unavailable; using public DNS")
 	for resolved := range queryAAndAAAAAddrIter(domain, publicDNS) {
-		log.Trace().Str("domain", domain).Str("resolved_ip", resolved.String()).Msg("public DNS fallback succeeded")
+		log.Info().Str("domain", requestedDomain).Str("resolved_ip", resolved.String()).Str("source", "public_fallback").Msg("DNS resolution succeeded")
 		return resolved, nil
 	}
-	log.Trace().Str("domain", domain).Msg("public DNS fallback exhausted")
 	return netip.Addr{}, errors.New("no address found")
 }
 
@@ -168,10 +164,9 @@ func resolveFromAuthoritativeServers(domain string) netip.Addr {
 	nsIndex := 0
 	for ns := range nsIter {
 		for resolved := range queryAAndAAAAAddrIter(domain, []netip.AddrPort{netip.AddrPortFrom(ns, 53)}) {
-			log.Trace().Str("domain", domain).Str("nameserver_addr", ns.String()).Str("resolved_ip", resolved.String()).Msg("Direct authoritative DNS resolution succeeded")
 			return resolved
 		}
-		log.Trace().Str("domain", domain).Str("nameserver_addr", ns.String()).Int("nameserver_addr_index", nsIndex).Msg("Direct authoritative nameserver produced no address")
+		log.Debug().Str("domain", domain).Str("nameserver_addr", ns.String()).Int("nameserver_addr_index", nsIndex).Msg("Authoritative nameserver returned no usable address")
 		nsIndex++
 	}
 	return netip.Addr{}
@@ -192,7 +187,6 @@ func unfoldCNAME(domain string, depth int) (string, error) {
 			return unfoldCNAME(target, depth-1)
 		}
 	}
-	log.Trace().Str("domain", domain).Msg("CNAME unfold complete")
 	return domain, nil
 }
 
@@ -278,8 +272,6 @@ DomainTrim:
 					hasA = true
 					seen[addr] = struct{}{}
 
-					log.Trace().Str("requested_domain", requestedDomain).Str("nameserver", ns.Ns).Str("source", "additional").Str("query_type", "A").Str("addr", addr.String()).Msg("Authoritative NS address yield")
-
 					if !yield(addr) { // 消费者不需要更多地址了，停止迭代
 						return
 					}
@@ -298,8 +290,6 @@ DomainTrim:
 					hasAAAA = true
 					seen[addr] = struct{}{}
 
-					log.Trace().Str("requested_domain", requestedDomain).Str("nameserver", ns.Ns).Str("source", "additional").Str("query_type", "AAAA").Str("addr", addr.String()).Msg("Authoritative NS address yield")
-
 					if !yield(addr) {
 						return
 					}
@@ -311,8 +301,6 @@ DomainTrim:
 				continue
 			}
 
-			log.Trace().Str("requested_domain", requestedDomain).Str("nameserver", ns.Ns).Bool("has_a", hasA).Bool("has_aaaa", hasAAAA).Strs("resolvers", addrPortStrings(publicDNS)).Msg("Authoritative NS hostname resolution supplements missing families")
-
 			missingTypes := make([]uint16, 0, 2)
 			if !hasA {
 				missingTypes = append(missingTypes, dns.TypeA)
@@ -320,6 +308,11 @@ DomainTrim:
 			if !hasAAAA && !conf.EnhancedDNS.DirectResolver.IPv4Only {
 				missingTypes = append(missingTypes, dns.TypeAAAA)
 			}
+			queryTypeNames := make([]string, 0, len(missingTypes))
+			for _, queryType := range missingTypes {
+				queryTypeNames = append(queryTypeNames, dnsTypeName(queryType))
+			}
+			log.Trace().Str("requested_domain", requestedDomain).Str("nameserver", ns.Ns).Strs("query_types", queryTypeNames).Msg("Resolving nameserver address")
 
 			// 通过公共 DNS 解析 NS 的主机名，获取缺失的地址族
 			for addr := range queryAddrIter(ns.Ns, publicDNS, missingTypes...) {
@@ -331,7 +324,6 @@ DomainTrim:
 				}
 
 				seen[addr] = struct{}{}
-				log.Trace().Str("requested_domain", requestedDomain).Str("nameserver", ns.Ns).Str("source", "hostname_lookup").Str("addr", addr.String()).Msg("Authoritative NS address yield")
 				if !yield(addr) {
 					return
 				}

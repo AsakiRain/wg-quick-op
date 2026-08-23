@@ -29,9 +29,6 @@ func Up(cfg *Config, iface string, logger zerolog.Logger) error {
 	if err := cfg.LoadPeers(); err != nil {
 		return fmt.Errorf("cannot parse peer config: %w", err)
 	}
-	if err := cfg.ResolveEndpoints(); err != nil {
-		return fmt.Errorf("cannot resolve peer config: %w", err)
-	}
 
 	for _, dns := range cfg.DNS {
 		if err := execSh("resolvconf -a tun.%i -m 0 -x", iface, logger, fmt.Sprintf("nameserver %s\n", dns)); err != nil {
